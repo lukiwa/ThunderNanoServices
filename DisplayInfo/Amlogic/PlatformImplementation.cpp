@@ -18,6 +18,7 @@
  */
 
 #include "../Module.h"
+#include "UdevDefinitions.h"
 #include "amlDrmUtils.h"
 #include <interfaces/IDRM.h>
 #include <interfaces/IDisplayInfo.h>
@@ -39,7 +40,6 @@ int openDefaultDRMDevice()
     pthread_mutex_lock(&drmFD_lock);
     if (drmFD < 0) {
         drmFD = open(DEFUALT_DRM_DEVICE, O_RDWR | O_CLOEXEC);
-        // Re-check if open successfully or not
         if (drmFD < 0) {
             printf("%s:%d cannot open %s\n", __FUNCTION__, __LINE__, DEFUALT_DRM_DEVICE);
         }
@@ -132,26 +132,122 @@ namespace Plugin {
           public Exchange::IConnectionProperties,
           public Exchange::IHDRProperties {
 
+    private:
+        class ConnectionObserver
+            : public Core::SocketDatagram,
+              public Core::Thread {
+
+        public:
+            ConnectionObserver(const ConnectionObserver&) = delete;
+            const ConnectionObserver& operator=(const ConnectionObserver&) = delete;
+
+            /**
+             * @brief Creates a NETLINK socket connection to get notified about udev messages
+             * related to HDMI hotplugs.
+             */
+            ConnectionObserver(DisplayInfoImplementation& parent)
+                // The group value of "2" stands for GROUP_UDEV, which filters out kernel messages,
+                // occuring before the device is initialized.
+                // https://insujang.github.io/2018-11-27/udev-device-manager-for-the-linux-kernel-in-userspace/
+                : Core::SocketDatagram(false, Core::NodeId(NETLINK_KOBJECT_UEVENT, 0, 2), Core::NodeId(), 512, 1024)
+                , _parent(parent)
+                , _requeryProps(false, true)
+            {
+                Open(Core::infinite);
+                Run();
+            }
+
+            ~ConnectionObserver() override
+            {
+                Stop();
+                _requeryProps.SetEvent();
+                Close(Core::infinite);
+            }
+
+            void StateChange() override {}
+
+            uint16_t SendData(uint8_t* dataFrame, const uint16_t maxSendSize) override
+            {
+                return 0;
+            }
+
+            uint16_t ReceiveData(uint8_t* dataFrame, const uint16_t receivedSize) override
+            {
+                bool drmEvent = false;
+                bool hotPlugEvent = false;
+
+                udev_monitor_netlink_header* header = reinterpret_cast<udev_monitor_netlink_header*>(dataFrame);
+
+                if (header->filter_tag_bloom_hi != 0 && header->filter_tag_bloom_lo != 0) {
+
+                    int data_index = header->properties_off / sizeof(uint8_t);
+                    auto data_ptr = reinterpret_cast<char*>(&(dataFrame[data_index]));
+                    auto values = GetMessageValues(data_ptr, header->properties_len);
+
+                    for (auto& value : values) {
+                        if (value == "DEVTYPE=drm_minor") {
+                            drmEvent = true;
+                        } else if (value == "HOTPLUG=1") {
+                            hotPlugEvent = true;
+                        }
+                    }
+                }
+
+                if (drmEvent && hotPlugEvent) {
+                    _requeryProps.SetEvent();
+                }
+
+                return receivedSize;
+            }
+
+            uint32_t Worker() override 
+            {
+                _requeryProps.Lock();
+
+                _parent.UpdateDisplayProperties();
+
+                _requeryProps.ResetEvent();
+
+                return (Core::infinite);
+            }
+
+        private:
+            uint16_t Events() override
+            {
+                return IsOpen() ? POLLIN : 0;
+            }
+
+            std::vector<std::string> GetMessageValues(char* values, uint32_t size)
+            {
+                std::vector<std::string> output;
+                for (int i = 0, output_index = 0; i < size; ++output_index) {
+                    char* data = &values[i];
+                    output.push_back(std::string(data));
+                    i += (strlen(data) + 1);
+                }
+                return output;
+            }
+
+            DisplayInfoImplementation& _parent;
+            Core::Event _requeryProps;
+        };
+
     public:
         DisplayInfoImplementation()
-            : _width(0)
+            : _hdmiObserver(*this)
+            , _width(0)
             , _height(0)
             , _connected(false)
             , _verticalFreq(0)
             , _hdcpprotection(HDCPProtectionType::HDCP_Unencrypted)
             , _type(HDR_OFF)
+            , _freeGpuRam(0)
             , _totalGpuRam(0)
             , _audioPassthrough(false)
             , _adminLock()
             , _activity(*this)
         {
-
-            UpdateTotalMem(_totalGpuRam);
-            UpdateDisplayInfo(_connected, _width, _height, _type, _verticalFreq);
-            UpdateAudioPassthrough(_audioPassthrough);
-            UpdateDisplayInfoHDCP(_hdcpprotection);
-
-            RegisterCallback();
+            UpdateDisplayProperties();
         }
 
         DisplayInfoImplementation(const DisplayInfoImplementation&) = delete;
@@ -161,13 +257,15 @@ namespace Plugin {
     public:
         uint32_t TotalGpuRam(uint64_t& total) const override
         {
-            total = _totalGpuRam;
+            // TODO: Fix this
+            total = GetMemory(AML_TOTAL_MEM_PARAM_STR);
             return Core::ERROR_NONE;
         }
 
         uint32_t FreeGpuRam(uint64_t& free) const override
         {
-            free = GetMemInfo(AML_FREE_MEM_PARAM_STR);
+            // TODO: Fix this
+            free = GetMemory(AML_FREE_MEM_PARAM_STR);
             return Core::ERROR_NONE;
         }
 
@@ -292,12 +390,12 @@ namespace Plugin {
         BEGIN_INTERFACE_MAP(DisplayInfoImplementation)
         INTERFACE_ENTRY(Exchange::IGraphicsProperties)
         INTERFACE_ENTRY(Exchange::IConnectionProperties)
+        INTERFACE_ENTRY(Exchange::IHDRProperties)
         END_INTERFACE_MAP
 
     private:
-        static uint64_t parseLine(const char* line)
+        uint64_t parseLine(const char* line)
         {
-
             string str(line);
             uint64_t val = 0;
             size_t begin = str.find_first_of("0123456789");
@@ -318,7 +416,7 @@ namespace Plugin {
             return val;
         }
 
-        static uint64_t GetMemInfo(const char* param)
+        uint64_t GetGPUMemory(const char* param)
         {
 
             uint64_t memVal = 0;
@@ -341,32 +439,18 @@ namespace Plugin {
             return memVal;
         }
 
-        void UpdateTotalMem(uint64_t& totalRam)
-        {
-            totalRam = GetMemInfo(AML_TOTAL_MEM_PARAM_STR);
-        }
-
-        inline void UpdateAudioPassthrough(bool& audioPassthrough)
-        {
-            audioPassthrough = false;
-        }
-
-        void UpdateDisplayInfo(bool& connected, uint32_t& width, uint32_t& height, HDRType& type, uint32_t& verticalFreq)
+        void UpdateDisplay()
         {
 #ifdef AMLOGIC_E2
             char strStatus[13] = { '\0' };
 
             amsysfs_get_sysfs_str("/sys/class/drm/card0-HDMI-A-1/status", strStatus, sizeof(strStatus));
             if (strncmp(strStatus, "connected", 9) == 0) {
-                connected = true;
+                _connected = true;
             } else {
-                connected = false;
+                _connected = false;
             }
-#else
-            connected = true; //Display always connected for Panel
-            verticalFreq = 60;
-#endif
-#ifdef AMLOGIC_E2
+
             amlError_t ret = amlERR_NONE;
             bool drmInitialized = false;
             int drmFD = -1;
@@ -427,62 +511,43 @@ namespace Plugin {
                 }
             }
 #else
-            height = 2160;
-            width = 4096;
+            _connected = true;
+            _verticalFreq = 60;
+            _height = 2160;
+            _width = 4096;
 #endif
-            // Read HDR status
-            type = HDR_DOLBYVISION;
-
-            // Read display width and height
+            _type = HDR_DOLBYVISION;
         }
 
-        void UpdateDisplayInfoHDCP(HDCPProtectionType hdcpprotection) const
+        void UpdateDisplayProperties()
         {
-            hdcpprotection = HDCPProtectionType::HDCP_2X;
-        }
+            _propertiesLock.Lock();
 
-        void RegisterCallback()
-        {
-        }
+            UpdateDisplay();
 
-        static void Callback(void* cbData, int param)
-        {
-            DisplayInfoImplementation* platform = static_cast<DisplayInfoImplementation*>(cbData);
+            _totalGpuRam = GetGPUMemory(AML_TOTAL_MEM_PARAM_STR);
+            _freeGpuRam = GetGPUMemory(AML_FREE_MEM_PARAM_STR);
 
-            switch (param) {
-            case 0:
-            case 1: {
-                platform->UpdateDisplayInfo();
-                break;
-            }
-            default:
-                break;
-            }
-        }
-
-        void UpdateDisplayInfo()
-        {
-            _adminLock.Lock();
-            UpdateDisplayInfo(_connected, _width, _height, _type, _verticalFreq);
-            _adminLock.Unlock();
+            _propertiesLock.Unlock();
 
             _activity.Submit();
         }
 
     private:
+        ConnectionObserver _hdmiObserver;
         uint32_t _width;
         uint32_t _height;
         bool _connected;
         uint32_t _verticalFreq;
-
         HDCPProtectionType _hdcpprotection;
         HDRType _type;
+        uint64_t _freeGpuRam;
         uint64_t _totalGpuRam;
         bool _audioPassthrough;
+        mutable Core::CriticalSection _propertiesLock;
 
         std::list<IConnectionProperties::INotification*> _observers;
-
-        mutable Core::CriticalSection _adminLock;
+        mutable Core::CriticalSection _observersLock;
 
         Core::WorkerPool::JobType<DisplayInfoImplementation&> _activity;
     };
