@@ -244,7 +244,8 @@ namespace Plugin {
             , _freeGpuRam(0)
             , _totalGpuRam(0)
             , _audioPassthrough(false)
-            , _adminLock()
+            , _propertiesLock()
+            , _observersLock()
             , _activity(*this)
         {
             UpdateDisplayProperties();
@@ -257,21 +258,25 @@ namespace Plugin {
     public:
         uint32_t TotalGpuRam(uint64_t& total) const override
         {
-            // TODO: Fix this
-            total = GetMemory(AML_TOTAL_MEM_PARAM_STR);
+            _propertiesLock.Lock();
+            total = _totalGpuRam;
+            _propertiesLock.Unlock();
+
             return Core::ERROR_NONE;
         }
 
         uint32_t FreeGpuRam(uint64_t& free) const override
         {
-            // TODO: Fix this
-            free = GetMemory(AML_FREE_MEM_PARAM_STR);
+            _propertiesLock.Lock();
+            free = _freeGpuRam;
+            _propertiesLock.Unlock();
+
             return Core::ERROR_NONE;
         }
 
         uint32_t Register(INotification* notification) override
         {
-            _adminLock.Lock();
+            _observersLock.Lock();
 
             // Make sure a sink is not registered multiple times.
             auto index = std::find(_observers.begin(), _observers.end(), notification);
@@ -282,14 +287,14 @@ namespace Plugin {
                 notification->AddRef();
             }
 
-            _adminLock.Unlock();
+            _observersLock.Unlock();
 
             return (Core::ERROR_NONE);
         }
 
         uint32_t Unregister(INotification* notification) override
         {
-            _adminLock.Lock();
+            _observersLock.Lock();
 
             std::list<IConnectionProperties::INotification*>::iterator index(std::find(_observers.begin(), _observers.end(), notification));
 
@@ -301,38 +306,53 @@ namespace Plugin {
                 _observers.erase(index);
             }
 
-            _adminLock.Unlock();
+            _observersLock.Unlock();
 
             return (Core::ERROR_NONE);
         }
 
         uint32_t IsAudioPassthrough(bool& passthru) const override
         {
+            _propertiesLock.Lock();
             passthru = _audioPassthrough;
+            _propertiesLock.Unlock();
+
             return Core::ERROR_NONE;
         }
 
         uint32_t Connected(bool& isconnected) const override
         {
+            _propertiesLock.Lock();
             isconnected = _connected;
+            _propertiesLock.Unlock();
+
             return Core::ERROR_NONE;
         }
 
         uint32_t Width(uint32_t& width) const override
         {
+            _propertiesLock.Lock();
             width = _width;
+            _propertiesLock.Unlock();
+
             return Core::ERROR_NONE;
         }
 
         uint32_t Height(uint32_t& height) const override
         {
+            _propertiesLock.Lock();
             height = _height;
+            _propertiesLock.Unlock();
+
             return Core::ERROR_NONE;
         }
 
         uint32_t VerticalFreq(uint32_t& vf) const override
         {
+            _propertiesLock.Lock();
             vf = _verticalFreq;
+            _propertiesLock.Unlock();
+
             return Core::ERROR_NONE;
         }
 
@@ -341,9 +361,22 @@ namespace Plugin {
             return Core::ERROR_UNAVAILABLE;
         }
 
+        uint32_t WidthInCentimeters(uint8_t& width /* @out */) const override
+        {
+            return Core::ERROR_UNAVAILABLE;
+        }
+
+        uint32_t HeightInCentimeters(uint8_t& heigth /* @out */) const override
+        {
+            return Core::ERROR_UNAVAILABLE;
+        }
+
         uint32_t HDCPProtection(HDCPProtectionType& value) const override
         {
+            _propertiesLock.Lock();
             value = _hdcpprotection;
+            _propertiesLock.Unlock();
+
             return Core::ERROR_NONE;
         }
 
@@ -369,22 +402,24 @@ namespace Plugin {
 
         uint32_t HDRSetting(HDRType& type) const override
         {
+            _propertiesLock.Lock();
             type = _type;
+            _propertiesLock.Unlock();
+
             return Core::ERROR_NONE;
         }
 
         void Dispatch() const
         {
-            _adminLock.Lock();
+            _observersLock.Lock();
 
             std::list<IConnectionProperties::INotification*>::const_iterator index = _observers.begin();
 
             if (index != _observers.end()) {
-                // Placeholder INotification::Source value.
-                (*index)->Updated(IConnectionProperties::INotification::Source::HDCP_CHANGE);
+                (*index)->Updated(IConnectionProperties::INotification::Source::HDMI_CHANGE);
             }
 
-            _adminLock.Unlock();
+            _observersLock.Unlock();
         }
 
         BEGIN_INTERFACE_MAP(DisplayInfoImplementation)
@@ -418,7 +453,7 @@ namespace Plugin {
 
         uint64_t GetGPUMemory(const char* param)
         {
-
+            // TODO: The following doesn't query the GPU ram.
             uint64_t memVal = 0;
             FILE* meminfoFile = fopen("/proc/meminfo", "r");
             if (NULL == meminfoFile) {
