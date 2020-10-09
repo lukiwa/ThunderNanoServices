@@ -1,0 +1,13 @@
+{
+ "locator":"libWPEFrameworkDisplayInfo.so",
+ "classname":"DisplayInfo",
+ "precondition":[
+  "Platform"
+ ],
+ "autostart":true,
+ "configuration":{
+  "root":{
+   "mode":"Off"
+  }
+ }
+}

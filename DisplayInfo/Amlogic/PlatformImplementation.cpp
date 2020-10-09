@@ -19,92 +19,15 @@
 
 #include "../Module.h"
 #include "UdevDefinitions.h"
-#include "amlDrmUtils.h"
+#include <core/Portability.h>
 #include <interfaces/IDRM.h>
 #include <interfaces/IDisplayInfo.h>
-#define AML_HDRSTANDARD_DolbyVision 4
-#define AML_HDCP_VERSION_1X 0
-#define AML_HDCP_VERSION_2X 1
 
-#define AML_TOTAL_MEM_PARAM_STR "CmaTotal:"
-#define AML_FREE_MEM_PARAM_STR "CmaFree:"
+#include <xf86drm.h>
+#include <xf86drmMode.h>
 
-#ifdef AMLOGIC_E2
-static pthread_mutex_t drmFD_lock = PTHREAD_MUTEX_INITIALIZER;
-drmModeConnector* hdmiConn;
-drmModeRes* res;
+#include <fstream>
 
-int openDefaultDRMDevice()
-{
-    int drmFD = -1;
-    pthread_mutex_lock(&drmFD_lock);
-    if (drmFD < 0) {
-        drmFD = open(DEFUALT_DRM_DEVICE, O_RDWR | O_CLOEXEC);
-        if (drmFD < 0) {
-            printf("%s:%d cannot open %s\n", __FUNCTION__, __LINE__, DEFUALT_DRM_DEVICE);
-        }
-    }
-    pthread_mutex_unlock(&drmFD_lock);
-    return drmFD;
-}
-
-int getSupportedDRMResolutions(drmModeConnector* conn, drmConnectorModes* drmResolution)
-{
-    for (int i = 0; i < conn->count_modes; i++) {
-        if (!strcmp(conn->modes[i].name, "720x480i")) {
-            drmResolution[i] = drmMode_480i;
-        } else if (!strcmp(conn->modes[i].name, "720x480")) {
-            drmResolution[i] = drmMode_480p;
-        } else if (!strcmp(conn->modes[i].name, "1280x720")) {
-            drmResolution[i] = drmMode_720p;
-        } else if (!strcmp(conn->modes[i].name, "1920x1080i")) {
-            drmResolution[i] = drmMode_1080i;
-        } else if (!strcmp(conn->modes[i].name, "1920x1080")) {
-            if (conn->modes[i].vrefresh == 60) {
-                drmResolution[i] = drmMode_1080p;
-            } else if (conn->modes[i].vrefresh == 24) {
-                drmResolution[i] = drmMode_1080p24;
-            } else if (conn->modes[i].vrefresh == 25) {
-                drmResolution[i] = drmMode_1080p25;
-            } else if (conn->modes[i].vrefresh == 30) {
-                drmResolution[i] = drmMode_1080p30;
-            } else if (conn->modes[i].vrefresh == 50) {
-                drmResolution[i] = drmMode_1080p50;
-            } else {
-                drmResolution[i] = drmMode_Unknown;
-            }
-        } else if (!strcmp(conn->modes[i].name, "3840x2160")) {
-            if (conn->modes[i].vrefresh == 24) {
-                drmResolution[i] = drmMode_3840x2160p24;
-            } else if (conn->modes[i].vrefresh == 25) {
-                drmResolution[i] = drmMode_3840x2160p25;
-            } else if (conn->modes[i].vrefresh == 30) {
-                drmResolution[i] = drmMode_3840x2160p30;
-            } else if (conn->modes[i].vrefresh == 50) {
-                drmResolution[i] = drmMode_3840x2160p50;
-            } else if (conn->modes[i].vrefresh == 60) {
-                drmResolution[i] = drmMode_3840x2160p60;
-            } else {
-                drmResolution[i] = drmMode_Unknown;
-            }
-        } else if (!strcmp(conn->modes[i].name, "4096x2160")) {
-            if (conn->modes[i].vrefresh == 24) {
-                drmResolution[i] = drmMode_4096x2160p24;
-            } else if (conn->modes[i].vrefresh == 25) {
-                drmResolution[i] = drmMode_4096x2160p25;
-            } else if (conn->modes[i].vrefresh == 30) {
-                drmResolution[i] = drmMode_4096x2160p30;
-            } else if (conn->modes[i].vrefresh == 50) {
-                drmResolution[i] = drmMode_4096x2160p50;
-            } else if (conn->modes[i].vrefresh == 60) {
-                drmResolution[i] = drmMode_4096x2160p60;
-            } else {
-                drmResolution[i] = drmMode_Unknown;
-            }
-        }
-    }
-    return 0;
-}
 int amsysfs_get_sysfs_str(const char* path, char* valstr, int size)
 {
     int fd;
@@ -121,8 +44,6 @@ int amsysfs_get_sysfs_str(const char* path, char* valstr, int size)
     };
     return 0;
 }
-
-#endif
 
 namespace WPEFramework {
 namespace Plugin {
@@ -178,6 +99,10 @@ namespace Plugin {
 
                 udev_monitor_netlink_header* header = reinterpret_cast<udev_monitor_netlink_header*>(dataFrame);
 
+                // TODO: These tags signify some filter, for now just filter out the 
+                // message that has this value as 0. Investigate further within udev,
+                // what do these filters mean and how to use them in order to
+                // get only a single message per hotplug.
                 if (header->filter_tag_bloom_hi != 0 && header->filter_tag_bloom_lo != 0) {
 
                     int data_index = header->properties_off / sizeof(uint8_t);
@@ -200,7 +125,7 @@ namespace Plugin {
                 return receivedSize;
             }
 
-            uint32_t Worker() override 
+            uint32_t Worker() override
             {
                 _requeryProps.Lock();
 
@@ -474,94 +399,55 @@ namespace Plugin {
             return memVal;
         }
 
-        void UpdateDisplay()
+        uint32_t UpdateDisplay()
         {
-#ifdef AMLOGIC_E2
-            char strStatus[13] = { '\0' };
+            uint32_t result = Core::ERROR_NONE;
+            int drmFD = open(DEFUALT_DRM_DEVICE, O_RDWR | O_CLOEXEC);
+            if (drmFD < 0) {
+                result = Core::ERROR_ILLEGAL_STATE;
+            } else if (drmModeRes* res = drmModeGetResources(drmFD)) {
 
-            amsysfs_get_sysfs_str("/sys/class/drm/card0-HDMI-A-1/status", strStatus, sizeof(strStatus));
-            if (strncmp(strStatus, "connected", 9) == 0) {
-                _connected = true;
-            } else {
-                _connected = false;
-            }
+                for (int i = 0; i < res->count_connectors; ++i) {
 
-            amlError_t ret = amlERR_NONE;
-            bool drmInitialized = false;
-            int drmFD = -1;
-            if (!drmInitialized) {
-                bool acquiredConnector = false;
-                drmFD = openDefaultDRMDevice();
-                if (drmFD < 0) {
-                    ret = amlERR_GENERAL;
-                }
-                /* retrieve resources */
-                res = drmModeGetResources(drmFD);
-                if (!res) {
-                    fprintf(stderr, "cannot retrieve DRM resources (%d): %m\n",
-                        errno);
-                    ret = amlERR_GENERAL;
-                }
+                    drmModeConnector* hdmiConn = drmModeGetConnector(drmFD, res->connectors[i]);
 
-                while (!acquiredConnector) {
-                    for (int i = 0; i < res->count_connectors; ++i) {
-                        /* get information for each connector */
-                        hdmiConn = drmModeGetConnector(drmFD, res->connectors[i]);
-                        if (!hdmiConn) {
-                            fprintf(stderr, "cannot retrieve DRM connector %u:%u (%d): %m\n",
-                                i, res->connectors[i], errno);
-                            continue;
+                    if (hdmiConn && hdmiConn->connector_type == DRM_MODE_CONNECTOR_HDMIA) {
+                        // TODO: There are multiple modes, which have the same resolution,
+                        // refresh rate, flags and type. Figure out which one should be picked.
+                        if (hdmiConn->modes) {
+                            _widthInCm = (hdmiConn->mmWidth / 10);
+                            _width = static_cast<uint32_t>(hdmiConn->modes[0].hdisplay);
+
+                            _heightInCm = (hdmiConn->mmHeight / 10);
+                            _height = static_cast<uint32_t>(hdmiConn->modes[0].vdisplay);
+
+                            _verticalFreq = hdmiConn->modes[0].vrefresh;
                         }
-                        if (hdmiConn->connector_type == DRM_MODE_CONNECTOR_HDMIA) { //Save connector pointer for HDMI Tx
-                            acquiredConnector = true;
-                            break;
-                        }
-
-                        continue;
+                        drmModeFreeConnector(hdmiConn);
                     }
                 }
+                drmModeFreeResources(res);
+                close(drmFD);
             }
-            drmConnectorModes supportedModes[drmMode_Max] = { drmMode_Unknown };
-            getSupportedDRMResolutions(hdmiConn, supportedModes);
-            for (int i = 0; i < drmMode_Max; i++) {
-                switch (supportedModes[i]) {
-                case drmMode_3840x2160p24:
-                case drmMode_3840x2160p25:
-                case drmMode_3840x2160p30:
-                case drmMode_3840x2160p50:
-                case drmMode_4096x2160p24:
-                case drmMode_4096x2160p25:
-                case drmMode_4096x2160p30:
-                case drmMode_4096x2160p50:
-                    height = 2160;
-                    width = 4096;
-                    break;
-                case drmMode_3840x2160p60:
-                case drmMode_4096x2160p60:
-                    height = 2160;
-                    width = 4096;
-                    break;
-                default:
-                    break;
-                }
-            }
-#else
-            _connected = true;
-            _verticalFreq = 60;
-            _height = 2160;
-            _width = 4096;
-#endif
-            _type = HDR_DOLBYVISION;
         }
 
         void UpdateDisplayProperties()
         {
             _propertiesLock.Lock();
 
-            UpdateDisplay();
+            _connected = IsConnected();
 
-            _totalGpuRam = GetGPUMemory(AML_TOTAL_MEM_PARAM_STR);
-            _freeGpuRam = GetGPUMemory(AML_FREE_MEM_PARAM_STR);
+            if (_connected) {
+                UpdateDisplay();
+                _totalGpuRam = GetGPUMemory(AML_TOTAL_MEM_PARAM_STR);
+                _freeGpuRam = GetGPUMemory(AML_FREE_MEM_PARAM_STR);
+            } else {
+                _height = 0;
+                _heightInCm = 0;
+                _width = 0;
+                _widthInCm = 0;
+                _verticalFreq = 0;
+            }
 
             _propertiesLock.Unlock();
 
@@ -569,9 +455,27 @@ namespace Plugin {
         }
 
     private:
+        bool IsConnected()
+        {
+            std::string line;
+            std::ifstream statusFile(STATUS_FILEPATH);
+            if (statusFile.is_open()) {
+                getline(statusFile, line);
+                statusFile.close();
+            }
+            return line == "connected";
+        }
+
+        static constexpr auto STATUS_FILEPATH = "/sys/class/drm/card0-HDMI-A-1/status";
+        static constexpr auto AML_TOTAL_MEM_PARAM_STR = "CmaTotal:";
+        static constexpr auto AML_FREE_MEM_PARAM_STR = "CmaFree:";
+        static constexpr auto DEFUALT_DRM_DEVICE = "/dev/dri/card0";
+
         ConnectionObserver _hdmiObserver;
         uint32_t _width;
+        uint32_t _widthInCm;
         uint32_t _height;
+        uint32_t _heightInCm;
         bool _connected;
         uint32_t _verticalFreq;
         HDCPProtectionType _hdcpprotection;
