@@ -27,23 +27,6 @@
 
 #include <fstream>
 
-int amsysfs_get_sysfs_str(const char* path, char* valstr, int size)
-{
-    int fd;
-    fd = open(path, O_RDONLY);
-    if (fd >= 0) {
-        memset(valstr, 0, size);
-        read(fd, valstr, size - 1);
-        valstr[strlen(valstr)] = '\0';
-        close(fd);
-    } else {
-        printf("%s:%d unable to open file %s,err: %s\n", __FUNCTION__, __LINE__, path, strerror(errno));
-        sprintf(valstr, "%s", "fail");
-        return -1;
-    };
-    return 0;
-}
-
 namespace WPEFramework {
 namespace Plugin {
 
