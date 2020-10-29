@@ -140,7 +140,7 @@ namespace Plugin {
             {
                 _requeryProps.Lock();
 
-                _parent.UpdateDisplayProperties();
+                _parent.Reinitialize();
 
                 _requeryProps.ResetEvent();
 
@@ -176,7 +176,7 @@ namespace Plugin {
             , _connected(false)
             , _verticalFreq(0)
             , _hdcpprotection(HDCPProtectionType::HDCP_Unencrypted)
-            , _type(HDR_OFF)
+            , _hdrType(HDR_OFF)
             , _freeGpuRam(0)
             , _totalGpuRam(0)
             , _audioPassthrough(false)
@@ -184,7 +184,7 @@ namespace Plugin {
             , _observersLock()
             , _activity(*this)
         {
-            UpdateDisplayProperties();
+            Reinitialize();
         }
 
         DisplayInfoImplementation(const DisplayInfoImplementation&) = delete;
@@ -339,7 +339,7 @@ namespace Plugin {
         uint32_t HDRSetting(HDRType& type) const override
         {
             _propertiesLock.Lock();
-            type = _type;
+            type = _hdrType;
             _propertiesLock.Unlock();
 
             return Core::ERROR_NONE;
@@ -365,55 +365,59 @@ namespace Plugin {
         END_INTERFACE_MAP
 
     private:
-        uint64_t parseLine(const char* line)
+        static constexpr auto DEFAULT_DRM_DEVICE = "/dev/dri/card0";
+        static constexpr auto STATUS_FILEPATH = "/sys/devices/platform/drm-subsystem/drm/card0/card0-HDMI-A-1/status";
+
+        static constexpr auto EDID_FILEPATH = "/sys/class/amhdmitx/amhdmitx0/rawedid";
+        static constexpr auto HDR_LEVEL_NODE = "/sys/devices/virtual/amhdmitx/amhdmitx0/hdmi_hdr_status";
+        static constexpr auto HDCP_LEVEL_NODE = "/sys/module/hdmitx20/parameters/hdmi_authenticated";
+
+        bool IsConnected()
         {
-            string str(line);
-            uint64_t val = 0;
-            size_t begin = str.find_first_of("0123456789");
-            size_t end = std::string::npos;
-
-            if (std::string::npos != begin)
-                end = str.find_first_not_of("0123456789", begin);
-
-            if (std::string::npos != begin && std::string::npos != end) {
-
-                str = str.substr(begin, end);
-                val = strtoul(str.c_str(), NULL, 10);
-
-            } else {
-                printf("%s:%d Failed to parse value from %s", __FUNCTION__, __LINE__, line);
-            }
-
-            return val;
+            return getFirstLine(STATUS_FILEPATH) == "connected";
         }
 
-        uint64_t GetGPUMemory(const char* param)
+        void Reinitialize()
         {
-            // TODO: The following doesn't query the GPU ram.
-            uint64_t memVal = 0;
-            FILE* meminfoFile = fopen("/proc/meminfo", "r");
-            if (NULL == meminfoFile) {
-                printf("%s:%d : Failed to open /proc/meminfo:%s", __FUNCTION__, __LINE__, strerror(errno));
+
+            using HDCPType = Exchange::IConnectionProperties::HDCPProtectionType;
+            _propertiesLock.Lock();
+
+            _connected = IsConnected();
+
+            if (_connected) {
+                UpdateDisplayProperties();
+                UpdateEDID();
+                UpdateProtectionProperties();
+                UpdateGraphicsProperties();
+                UpdateHDRProperties();
             } else {
-                std::vector<char> buf;
-                buf.resize(1024);
-
-                while (fgets(buf.data(), buf.size(), meminfoFile)) {
-                    if (strstr(buf.data(), param) == buf.data()) {
-                        memVal = parseLine(buf.data()) * 1000;
-                        break;
-                    }
-                }
-
-                fclose(meminfoFile);
+                _height = 0;
+                _width = 0;
+                _verticalFreq = 0;
+                _hdcpprotection = HDCPType::HDCP_Unencrypted;
+                _hdrType = Exchange::IHDRProperties::HDRType::HDR_OFF;
+                _freeGpuRam = 0;
+                _totalGpuRam = 0;
+                _audioPassthrough = false;
             }
-            return memVal;
+
+            TRACE(Trace::Information, (_T("HDMI: %s, %dx%d %d [Hz], HDCPProtectionType: %d, HDRType %d"), (_connected ? "on" : "off")
+                , _width
+                , _height
+                , _verticalFreq
+                , static_cast<int>(_hdcpprotection)
+                , static_cast<int>(_hdrType)));
+
+                _propertiesLock.Unlock();
+
+            _activity.Submit();
         }
 
-        uint32_t UpdateDisplay()
+        void UpdateDisplayProperties()
         {
             uint32_t result = Core::ERROR_NONE;
-            int drmFD = open(DEFUALT_DRM_DEVICE, O_RDWR | O_CLOEXEC);
+            int drmFD = open(DEFAULT_DRM_DEVICE, O_RDWR | O_CLOEXEC);
             if (drmFD < 0) {
                 result = Core::ERROR_ILLEGAL_STATE;
             } else if (drmModeRes* res = drmModeGetResources(drmFD)) {
@@ -426,12 +430,8 @@ namespace Plugin {
                         // TODO: There are multiple modes, which have the same resolution,
                         // refresh rate, flags and type. Figure out which one should be picked.
                         if (hdmiConn->modes) {
-                            _widthInCm = (hdmiConn->mmWidth / 10);
                             _width = static_cast<uint32_t>(hdmiConn->modes[0].hdisplay);
-
-                            _heightInCm = (hdmiConn->mmHeight / 10);
                             _height = static_cast<uint32_t>(hdmiConn->modes[0].vdisplay);
-
                             _verticalFreq = hdmiConn->modes[0].vrefresh;
                         }
                         drmModeFreeConnector(hdmiConn);
@@ -440,66 +440,75 @@ namespace Plugin {
                 drmModeFreeResources(res);
                 close(drmFD);
             }
+
+
         }
 
-        void UpdateDisplayProperties()
+        void UpdateEDID() 
         {
-            _propertiesLock.Lock();
 
-            _connected = IsConnected();
-
-            if (_connected) {
-                UpdateDisplay();
-                _totalGpuRam = GetGPUMemory(AML_TOTAL_MEM_PARAM_STR);
-                _freeGpuRam = GetGPUMemory(AML_FREE_MEM_PARAM_STR);
-            } else {
-                _height = 0;
-                _heightInCm = 0;
-                _width = 0;
-                _widthInCm = 0;
-                _verticalFreq = 0;
-            }
-
-            _propertiesLock.Unlock();
-
-            _activity.Submit();
         }
 
-    private:
-        bool IsConnected()
+        void UpdateProtectionProperties()
+        {
+            std::string hdcpStr = getFirstLine(HDCP_LEVEL_NODE);
+            if (hdcpStr == "22") {
+                _hdcpprotection = Exchange::IConnectionProperties::HDCPProtectionType::HDCP_2X;
+            } else if (hdcpStr == "14") {
+                _hdcpprotection = Exchange::IConnectionProperties::HDCPProtectionType::HDCP_1X;
+            } else {
+                TRACE(Trace::Error, (_T("Received HDCP value: %s"), hdcpStr.c_str()));
+                _hdcpprotection = Exchange::IConnectionProperties::HDCPProtectionType::HDCP_Unencrypted;
+            }
+        }
+
+        void UpdateGraphicsProperties()
+        {
+
+        }
+
+        void UpdateHDRProperties()
+        {
+            std::string hdrStr = getFirstLine(HDR_LEVEL_NODE);
+            if(hdrStr == "SDR") {
+                _hdrType = Exchange::IHDRProperties::HDRType::HDR_OFF;
+            } else {
+                TRACE(Trace::Error, (_T("HDR value not being handled %s"), hdrStr.c_str()));
+            }
+        }
+
+        uint64_t GetGPUMemory(const char* param)
+        {
+        }
+
+        std::string getFirstLine(const std::string& filepath)
         {
             std::string line;
-            std::ifstream statusFile(STATUS_FILEPATH);
+            std::ifstream statusFile(filepath);
+
             if (statusFile.is_open()) {
                 getline(statusFile, line);
                 statusFile.close();
             }
-            return line == "connected";
+            return line;
         }
-
-        static constexpr auto STATUS_FILEPATH = "/sys/class/drm/card0-HDMI-A-1/status";
-        static constexpr auto AML_TOTAL_MEM_PARAM_STR = "CmaTotal:";
-        static constexpr auto AML_FREE_MEM_PARAM_STR = "CmaFree:";
-        static constexpr auto DEFUALT_DRM_DEVICE = "/dev/dri/card0";
 
         ConnectionObserver _hdmiObserver;
         uint32_t _width;
-        uint32_t _widthInCm;
         uint32_t _height;
-        uint32_t _heightInCm;
         bool _connected;
         uint32_t _verticalFreq;
         HDCPProtectionType _hdcpprotection;
-        HDRType _type;
+        HDRType _hdrType;
         uint64_t _freeGpuRam;
         uint64_t _totalGpuRam;
         bool _audioPassthrough;
+        std::unique_ptr<uint8_t[]> _edid;
         mutable Core::CriticalSection _propertiesLock;
 
+        Core::WorkerPool::JobType<DisplayInfoImplementation&> _activity;
         std::list<IConnectionProperties::INotification*> _observers;
         mutable Core::CriticalSection _observersLock;
-
-        Core::WorkerPool::JobType<DisplayInfoImplementation&> _activity;
     };
 
     SERVICE_REGISTRATION(DisplayInfoImplementation, 1, 0);
