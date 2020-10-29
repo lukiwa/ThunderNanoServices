@@ -110,7 +110,7 @@ namespace Plugin {
 
                 udev_monitor_netlink_header* header = reinterpret_cast<udev_monitor_netlink_header*>(dataFrame);
 
-                // TODO: These tags signify some filter, for now just filter out the 
+                // TODO: These tags signify some filter, for now just filter out the
                 // message that has this value as 0. Investigate further within udev,
                 // what do these filters mean and how to use them in order to
                 // get only a single message per hotplug.
@@ -180,6 +180,7 @@ namespace Plugin {
             , _freeGpuRam(0)
             , _totalGpuRam(0)
             , _audioPassthrough(false)
+            , _edid()
             , _propertiesLock()
             , _observersLock()
             , _activity(*this)
@@ -194,27 +195,18 @@ namespace Plugin {
     public:
         uint32_t TotalGpuRam(uint64_t& total) const override
         {
-            _propertiesLock.Lock();
-            total = _totalGpuRam;
-            _propertiesLock.Unlock();
-
-            return Core::ERROR_NONE;
+            return Core::ERROR_UNAVAILABLE;
         }
 
         uint32_t FreeGpuRam(uint64_t& free) const override
         {
-            _propertiesLock.Lock();
-            free = _freeGpuRam;
-            _propertiesLock.Unlock();
-
-            return Core::ERROR_NONE;
+            return Core::ERROR_UNAVAILABLE;
         }
 
         uint32_t Register(INotification* notification) override
         {
             _observersLock.Lock();
-
-            // Make sure a sink is not registered multiple times.
+            
             auto index = std::find(_observers.begin(), _observers.end(), notification);
             ASSERT(index == _observers.end());
 
@@ -234,7 +226,6 @@ namespace Plugin {
 
             std::list<IConnectionProperties::INotification*>::iterator index(std::find(_observers.begin(), _observers.end(), notification));
 
-            // Make sure you do not unregister something you did not register !!!
             ASSERT(index != _observers.end());
 
             if (index != _observers.end()) {
@@ -294,7 +285,12 @@ namespace Plugin {
 
         uint32_t EDID(uint16_t& length, uint8_t data[]) const override
         {
-            return Core::ERROR_UNAVAILABLE;
+            _propertiesLock.Lock();
+            data = const_cast<uint8_t*>(_edid.data());
+            length = _edid.size();
+            _propertiesLock.Unlock();
+
+            return Core::ERROR_NONE;
         }
 
         uint32_t WidthInCentimeters(uint8_t& width /* @out */) const override
@@ -367,8 +363,7 @@ namespace Plugin {
     private:
         static constexpr auto DEFAULT_DRM_DEVICE = "/dev/dri/card0";
         static constexpr auto STATUS_FILEPATH = "/sys/devices/platform/drm-subsystem/drm/card0/card0-HDMI-A-1/status";
-
-        static constexpr auto EDID_FILEPATH = "/sys/class/amhdmitx/amhdmitx0/rawedid";
+        static constexpr auto EDID_FILEPATH = "/sys/devices/platform/drm-subsystem/drm/card0/card0-HDMI-A-1/edid";
         static constexpr auto HDR_LEVEL_NODE = "/sys/devices/virtual/amhdmitx/amhdmitx0/hdmi_hdr_status";
         static constexpr auto HDCP_LEVEL_NODE = "/sys/module/hdmitx20/parameters/hdmi_authenticated";
 
@@ -387,7 +382,6 @@ namespace Plugin {
 
             if (_connected) {
                 UpdateDisplayProperties();
-                UpdateEDID();
                 UpdateProtectionProperties();
                 UpdateGraphicsProperties();
                 UpdateHDRProperties();
@@ -402,14 +396,9 @@ namespace Plugin {
                 _audioPassthrough = false;
             }
 
-            TRACE(Trace::Information, (_T("HDMI: %s, %dx%d %d [Hz], HDCPProtectionType: %d, HDRType %d"), (_connected ? "on" : "off")
-                , _width
-                , _height
-                , _verticalFreq
-                , static_cast<int>(_hdcpprotection)
-                , static_cast<int>(_hdrType)));
+            TRACE(Trace::Information, (_T("HDMI: %s, %dx%d %d [Hz], HDCPProtectionType: %d, HDRType %d"), (_connected ? "on" : "off"), _width, _height, _verticalFreq, static_cast<int>(_hdcpprotection), static_cast<int>(_hdrType)));
 
-                _propertiesLock.Unlock();
+            _propertiesLock.Unlock();
 
             _activity.Submit();
         }
@@ -441,12 +430,9 @@ namespace Plugin {
                 close(drmFD);
             }
 
-
-        }
-
-        void UpdateEDID() 
-        {
-
+            std::ifstream instream(EDID_FILEPATH, std::ios::in | std::ios::binary);
+            _edid = std::vector<uint8_t>((std::istreambuf_iterator<char>(instream)),
+                std::istreambuf_iterator<char>());
         }
 
         void UpdateProtectionProperties()
@@ -464,13 +450,12 @@ namespace Plugin {
 
         void UpdateGraphicsProperties()
         {
-
         }
 
         void UpdateHDRProperties()
         {
             std::string hdrStr = getFirstLine(HDR_LEVEL_NODE);
-            if(hdrStr == "SDR") {
+            if (hdrStr == "SDR") {
                 _hdrType = Exchange::IHDRProperties::HDRType::HDR_OFF;
             } else {
                 TRACE(Trace::Error, (_T("HDR value not being handled %s"), hdrStr.c_str()));
@@ -503,7 +488,7 @@ namespace Plugin {
         uint64_t _freeGpuRam;
         uint64_t _totalGpuRam;
         bool _audioPassthrough;
-        std::unique_ptr<uint8_t[]> _edid;
+        std::vector<uint8_t> _edid;
         mutable Core::CriticalSection _propertiesLock;
 
         Core::WorkerPool::JobType<DisplayInfoImplementation&> _activity;
