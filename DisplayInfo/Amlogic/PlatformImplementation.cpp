@@ -18,6 +18,7 @@
  */
 
 #include "../Module.h"
+#include "DRMConnector.h"
 #include <core/Portability.h>
 #include <interfaces/IDRM.h>
 #include <interfaces/IDisplayInfo.h>
@@ -176,6 +177,8 @@ namespace Plugin {
     public:
         DisplayInfoImplementation()
             : _hdmiObserver(*this)
+            , _usePreferredDrmMode(false)
+            , _drmCard(DEFAULT_DRM_DEVICE)
             , _width(0)
             , _height(0)
             , _connected(false)
@@ -190,6 +193,13 @@ namespace Plugin {
             , _observersLock()
             , _activity(*this)
         {
+            _usePreferredDrmMode = (std::getenv("WESTEROS_GL_USE_PREFERRED_MODE") != nullptr);
+            _useBestDrmMode = (std::getenv("WESTEROS_GL_USE_BEST_MODE") != nullptr);
+
+            std::string tmpCardName;
+            if (Core::SystemInfo::GetEnvironment("WESTEROS_DRM_CARD", tmpCardName) && !tmpCardName.empty()) {
+                _drmCard = tmpCardName;
+            }
             Reinitialize();
         }
 
@@ -405,6 +415,7 @@ namespace Plugin {
 
             if (_connected) {
                 UpdateDisplayProperties();
+                UpdateEDID();
                 UpdateProtectionProperties();
                 UpdateGraphicsProperties();
                 UpdateHDRProperties();
@@ -429,33 +440,27 @@ namespace Plugin {
 
         void UpdateDisplayProperties()
         {
-            bool reset = true;
-            int drmFD = open(DEFAULT_DRM_DEVICE, O_RDWR | O_CLOEXEC);
-            if (drmFD < 0) {
-                TRACE(Trace::Error, (_T("Could not open drm file.")));
-            } else if (drmModeRes* res = drmModeGetResources(drmFD)) {
-                for (int i = 0; i < res->count_connectors; ++i) {
-                    drmModeConnector* hdmiConn = drmModeGetConnector(drmFD, res->connectors[i]);
-                    if (hdmiConn && hdmiConn->connector_type == DRM_MODE_CONNECTOR_HDMIA) {
+            using namespace AMLogic;
+            DRMConnector connector(_drmCard, DRM_MODE_CONNECTOR_HDMIA);
+            drmModeModeInfoPtr selectedMode = _usePreferredDrmMode ? connector.PreferredMode()
+                                                                   : (_useBestDrmMode ? connector.BestMode() : connector.DefaultMode());
 
-                        if (hdmiConn->modes) {
-                            reset = false;
-                            _width = static_cast<uint32_t>(hdmiConn->modes[0].hdisplay);
-                            _height = static_cast<uint32_t>(hdmiConn->modes[0].vdisplay);
-                            _verticalFreq = hdmiConn->modes[0].vrefresh;
-                        }
-                        drmModeFreeConnector(hdmiConn);
-                    }
-                }
-                drmModeFreeResources(res);
-                close(drmFD);
-            }
-
-            if (reset) {
+            if (selectedMode != nullptr) {
+                _width = selectedMode->hdisplay;
+                _height = selectedMode->vdisplay;
+                _verticalFreq = selectedMode->vrefresh;
+            } else {
                 _width = 0;
                 _height = 0;
                 _verticalFreq = 0;
             }
+        }
+
+        void UpdateEDID()
+        {
+            std::ifstream instream(EDID_NODE, std::ios::in | std::ios::binary);
+            _edid = std::vector<uint8_t>((std::istreambuf_iterator<char>(instream)),
+                std::istreambuf_iterator<char>());
         }
 
         void UpdateProtectionProperties()
@@ -500,7 +505,7 @@ namespace Plugin {
                 return std::stoul(str.substr(first, last - first + 1));
             };
 
-            auto values = getMemoryStats("/proc/meminfo", { "CmaTotal", "CmaFree" });
+            auto values = getMemoryStats("/proc/meminfo", { TOTAL_GPU_MEM_KEY, FREE_GPU_MEM_KEY });
             if (!values.first.empty() && !values.second.empty()) {
                 _freeGpuRam = extractNumbers(values.second);
                 _totalGpuRam = extractNumbers(values.first);
@@ -543,6 +548,10 @@ namespace Plugin {
             _audioPassthrough = false;
             _edid.clear();
         }
+
+        bool _usePreferredDrmMode;
+        bool _useBestDrmMode;
+        std::string _drmCard;
 
         ConnectionObserver _hdmiObserver;
         uint32_t _width;
