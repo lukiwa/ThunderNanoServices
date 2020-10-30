@@ -200,6 +200,7 @@ namespace Plugin {
             if (Core::SystemInfo::GetEnvironment("WESTEROS_DRM_CARD", tmpCardName) && !tmpCardName.empty()) {
                 _drmCard = tmpCardName;
             }
+            SetSystemPaths();
             Reinitialize();
         }
 
@@ -381,16 +382,28 @@ namespace Plugin {
 
     private:
         static constexpr auto DEFAULT_DRM_DEVICE = "/dev/dri/card0";
-        static constexpr auto HDMI_STATUS_NODE = "/sys/devices/platform/drm-subsystem/drm/card0/card0-HDMI-A-1/status";
-        static constexpr auto EDID_NODE = "/sys/devices/platform/drm-subsystem/drm/card0/card0-HDMI-A-1/edid";
+        static constexpr auto DRM_PREFIX = "/sys/devices/platform/drm-subsystem/drm/";
         static constexpr auto HDR_LEVEL_NODE = "/sys/devices/virtual/amhdmitx/amhdmitx0/hdmi_hdr_status";
         static constexpr auto HDCP_LEVEL_NODE = "/sys/module/hdmitx20/parameters/hdmi_authenticated";
         static constexpr auto TOTAL_GPU_MEM_KEY = "CmaTotal";
         static constexpr auto FREE_GPU_MEM_KEY = "CmaFree";
 
+        void SetSystemPaths()
+        {
+            if(_drmCard == DEFAULT_DRM_DEVICE) {
+                _hdmiStatusNode = DRM_PREFIX + std::string("card0/card0-HDMI-A-1/status");
+                _edidNode = DRM_PREFIX + std::string("card0/card0-HDMI-A-1/edid");
+            } else {
+                std::string cardName = _drmCard.substr(_drmCard.find_last_of("/") + 1);
+                std::string basePath = DRM_PREFIX + std::string(cardName + "/" + cardName + "-HDMI-A-1/");
+                _hdmiStatusNode = basePath + "status";
+                _edidNode = basePath + "edid";
+            }
+        }
+
         bool IsConnected()
         {
-            return getLine(HDMI_STATUS_NODE) == "connected";
+            return getLine(DRM_PREFIX + _hdmiStatusNode) == "connected";
         }
 
         std::string getLine(const std::string& filepath)
@@ -458,7 +471,7 @@ namespace Plugin {
 
         void UpdateEDID()
         {
-            std::ifstream instream(EDID_NODE, std::ios::in | std::ios::binary);
+            std::ifstream instream(DRM_PREFIX + _edidNode, std::ios::in | std::ios::binary);
             _edid = std::vector<uint8_t>((std::istreambuf_iterator<char>(instream)),
                 std::istreambuf_iterator<char>());
         }
@@ -552,6 +565,8 @@ namespace Plugin {
         bool _usePreferredDrmMode;
         bool _useBestDrmMode;
         std::string _drmCard;
+        std::string _hdmiStatusNode;
+        std::string _edidNode;
 
         ConnectionObserver _hdmiObserver;
         uint32_t _width;
