@@ -26,6 +26,7 @@
 #include <xf86drmMode.h>
 
 #include <fstream>
+#include <string>
 
 namespace WPEFramework {
 namespace Plugin {
@@ -199,12 +200,20 @@ namespace Plugin {
     public:
         uint32_t TotalGpuRam(uint64_t& total) const override
         {
-            return Core::ERROR_UNAVAILABLE;
+            _propertiesLock.Lock();
+            total = _totalGpuRam;
+            _propertiesLock.Unlock();
+
+            return Core::ERROR_NONE;
         }
 
         uint32_t FreeGpuRam(uint64_t& free) const override
         {
-            return Core::ERROR_UNAVAILABLE;
+            _propertiesLock.Lock();
+            free = _freeGpuRam;
+            _propertiesLock.Unlock();
+
+            return Core::ERROR_NONE;
         }
 
         uint32_t Register(INotification* notification) override
@@ -244,11 +253,7 @@ namespace Plugin {
 
         uint32_t IsAudioPassthrough(bool& passthru) const override
         {
-            _propertiesLock.Lock();
-            passthru = _audioPassthrough;
-            _propertiesLock.Unlock();
-
-            return Core::ERROR_NONE;
+            return Core::ERROR_UNAVAILABLE;
         }
 
         uint32_t Connected(bool& isconnected) const override
@@ -370,10 +375,26 @@ namespace Plugin {
         static constexpr auto EDID_NODE = "/sys/devices/platform/drm-subsystem/drm/card0/card0-HDMI-A-1/edid";
         static constexpr auto HDR_LEVEL_NODE = "/sys/devices/virtual/amhdmitx/amhdmitx0/hdmi_hdr_status";
         static constexpr auto HDCP_LEVEL_NODE = "/sys/module/hdmitx20/parameters/hdmi_authenticated";
+        static constexpr auto TOTAL_GPU_MEM_KEY = "CmaTotal";
+        static constexpr auto FREE_GPU_MEM_KEY = "CmaFree";
 
         bool IsConnected()
         {
-            return getFirstLine(HDMI_STATUS_NODE) == "connected";
+            return getLine(HDMI_STATUS_NODE) == "connected";
+        }
+
+        std::string getLine(const std::string& filepath)
+        {
+            std::string line;
+            std::ifstream statusFile(filepath);
+
+            if (statusFile.is_open()) {
+                getline(statusFile, line);
+                statusFile.close();
+            } else {
+                TRACE(Trace::Error, (_T("Could not open file: %s"), filepath.c_str()));
+            }
+            return line;
         }
 
         void Reinitialize()
@@ -388,18 +409,11 @@ namespace Plugin {
                 UpdateGraphicsProperties();
                 UpdateHDRProperties();
             } else {
-                _height = 0;
-                _width = 0;
-                _verticalFreq = 0;
-                _hdcpprotection = Exchange::IConnectionProperties::HDCPProtectionType::HDCP_Unencrypted;
-                _hdrType = Exchange::IHDRProperties::HDRType::HDR_OFF;
-                _freeGpuRam = 0;
-                _totalGpuRam = 0;
-                _audioPassthrough = false;
+                ResetValues();
             }
 
             /* clang-format off */
-            TRACE(Trace::Information, (_T("HDMI: %s, %dx%d %d [Hz], HDCPProtectionType: %d, HDRType %d")
+            TRACE(Trace::Information, (_T("HDMI: %s, %dx%d %d [Hz], HDCPProtectionType: %d, HDRType: %d")
                 , (_connected ? "on" : "off")
                 , _width
                 , _height
@@ -415,20 +429,17 @@ namespace Plugin {
 
         void UpdateDisplayProperties()
         {
-            uint32_t result = Core::ERROR_NONE;
+            bool reset = true;
             int drmFD = open(DEFAULT_DRM_DEVICE, O_RDWR | O_CLOEXEC);
             if (drmFD < 0) {
-                result = Core::ERROR_ILLEGAL_STATE;
+                TRACE(Trace::Error, (_T("Could not open drm file.")));
             } else if (drmModeRes* res = drmModeGetResources(drmFD)) {
-
                 for (int i = 0; i < res->count_connectors; ++i) {
-
                     drmModeConnector* hdmiConn = drmModeGetConnector(drmFD, res->connectors[i]);
-
                     if (hdmiConn && hdmiConn->connector_type == DRM_MODE_CONNECTOR_HDMIA) {
-                        // TODO: There are multiple modes, which have the same resolution,
-                        // refresh rate, flags and type. Figure out which one should be picked.
+
                         if (hdmiConn->modes) {
+                            reset = false;
                             _width = static_cast<uint32_t>(hdmiConn->modes[0].hdisplay);
                             _height = static_cast<uint32_t>(hdmiConn->modes[0].vdisplay);
                             _verticalFreq = hdmiConn->modes[0].vrefresh;
@@ -440,14 +451,16 @@ namespace Plugin {
                 close(drmFD);
             }
 
-            std::ifstream instream(EDID_NODE, std::ios::in | std::ios::binary);
-            _edid = std::vector<uint8_t>((std::istreambuf_iterator<char>(instream)),
-                std::istreambuf_iterator<char>());
+            if (reset) {
+                _width = 0;
+                _height = 0;
+                _verticalFreq = 0;
+            }
         }
 
         void UpdateProtectionProperties()
         {
-            std::string hdcpStr = getFirstLine(HDCP_LEVEL_NODE);
+            std::string hdcpStr = getLine(HDCP_LEVEL_NODE);
             if (hdcpStr == "22") {
                 _hdcpprotection = Exchange::IConnectionProperties::HDCPProtectionType::HDCP_2X;
             } else if (hdcpStr == "14") {
@@ -458,13 +471,9 @@ namespace Plugin {
             }
         }
 
-        void UpdateGraphicsProperties()
-        {
-        }
-
         void UpdateHDRProperties()
         {
-            std::string hdrStr = getFirstLine(HDR_LEVEL_NODE);
+            std::string hdrStr = getLine(HDR_LEVEL_NODE);
             if (hdrStr == "SDR") {
                 _hdrType = Exchange::IHDRProperties::HDRType::HDR_OFF;
             } else if (hdrStr == "HDR10-GAMMA_ST2084") {
@@ -483,22 +492,56 @@ namespace Plugin {
             }
         }
 
-        uint64_t GetGPUMemory(const char* param)
+        void UpdateGraphicsProperties()
         {
+            auto extractNumbers = [](const std::string& str) {
+                auto first = str.find_first_of("0123456789");
+                auto last = str.find_last_of("0123456789");
+                return std::stoul(str.substr(first, last - first + 1));
+            };
+
+            auto values = getMemoryStats("/proc/meminfo", { "CmaTotal", "CmaFree" });
+            if (!values.first.empty() && !values.second.empty()) {
+                _freeGpuRam = extractNumbers(values.second);
+                _totalGpuRam = extractNumbers(values.first);
+            } else {
+                _totalGpuRam = 0;
+                _freeGpuRam = 0;
+            }
         }
 
-        std::string getFirstLine(const std::string& filepath)
+        std::pair<std::string, std::string> getMemoryStats(const std::string& filepath,
+            const std::pair<std::string, std::string>& keys)
         {
             std::string line;
             std::ifstream statusFile(filepath);
+            std::pair<std::string, std::string> result;
 
             if (statusFile.is_open()) {
-                getline(statusFile, line);
+                while ((result.first.empty() || result.second.empty()) && getline(statusFile, line)) {
+                    if (line.find(keys.first) != std::string::npos)
+                        result.first = line;
+                    else if (line.find(keys.second) != std::string::npos)
+                        result.second = line;
+                }
                 statusFile.close();
             } else {
                 TRACE(Trace::Error, (_T("Could not open file: %s"), filepath.c_str()));
             }
-            return line;
+            return result;
+        }
+
+        void ResetValues()
+        {
+            _height = 0;
+            _width = 0;
+            _verticalFreq = 0;
+            _hdcpprotection = Exchange::IConnectionProperties::HDCPProtectionType::HDCP_Unencrypted;
+            _hdrType = Exchange::IHDRProperties::HDRType::HDR_OFF;
+            _totalGpuRam = 0;
+            _freeGpuRam = 0;
+            _audioPassthrough = false;
+            _edid.clear();
         }
 
         ConnectionObserver _hdmiObserver;
@@ -508,8 +551,8 @@ namespace Plugin {
         uint32_t _verticalFreq;
         HDCPProtectionType _hdcpprotection;
         HDRType _hdrType;
-        uint64_t _freeGpuRam;
         uint64_t _totalGpuRam;
+        uint64_t _freeGpuRam;
         bool _audioPassthrough;
         std::vector<uint8_t> _edid;
         mutable Core::CriticalSection _propertiesLock;
