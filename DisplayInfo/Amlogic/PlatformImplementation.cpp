@@ -362,20 +362,18 @@ namespace Plugin {
 
     private:
         static constexpr auto DEFAULT_DRM_DEVICE = "/dev/dri/card0";
-        static constexpr auto STATUS_FILEPATH = "/sys/devices/platform/drm-subsystem/drm/card0/card0-HDMI-A-1/status";
-        static constexpr auto EDID_FILEPATH = "/sys/devices/platform/drm-subsystem/drm/card0/card0-HDMI-A-1/edid";
+        static constexpr auto HDMI_STATUS_NODE = "/sys/devices/platform/drm-subsystem/drm/card0/card0-HDMI-A-1/status";
+        static constexpr auto EDID_NODE = "/sys/devices/platform/drm-subsystem/drm/card0/card0-HDMI-A-1/edid";
         static constexpr auto HDR_LEVEL_NODE = "/sys/devices/virtual/amhdmitx/amhdmitx0/hdmi_hdr_status";
         static constexpr auto HDCP_LEVEL_NODE = "/sys/module/hdmitx20/parameters/hdmi_authenticated";
 
         bool IsConnected()
         {
-            return getFirstLine(STATUS_FILEPATH) == "connected";
+            return getFirstLine(HDMI_STATUS_NODE) == "connected";
         }
 
         void Reinitialize()
         {
-
-            using HDCPType = Exchange::IConnectionProperties::HDCPProtectionType;
             _propertiesLock.Lock();
 
             _connected = IsConnected();
@@ -389,14 +387,22 @@ namespace Plugin {
                 _height = 0;
                 _width = 0;
                 _verticalFreq = 0;
-                _hdcpprotection = HDCPType::HDCP_Unencrypted;
+                _hdcpprotection = Exchange::IConnectionProperties::HDCPProtectionType::HDCP_Unencrypted;
                 _hdrType = Exchange::IHDRProperties::HDRType::HDR_OFF;
                 _freeGpuRam = 0;
                 _totalGpuRam = 0;
                 _audioPassthrough = false;
             }
 
-            TRACE(Trace::Information, (_T("HDMI: %s, %dx%d %d [Hz], HDCPProtectionType: %d, HDRType %d"), (_connected ? "on" : "off"), _width, _height, _verticalFreq, static_cast<int>(_hdcpprotection), static_cast<int>(_hdrType)));
+            /* clang-format off */
+            TRACE(Trace::Information, (_T("HDMI: %s, %dx%d %d [Hz], HDCPProtectionType: %d, HDRType %d")
+                , (_connected ? "on" : "off")
+                , _width
+                , _height
+                , _verticalFreq
+                , static_cast<int>(_hdcpprotection)
+                , static_cast<int>(_hdrType)));
+            /* clang-format on */
 
             _propertiesLock.Unlock();
 
@@ -430,7 +436,7 @@ namespace Plugin {
                 close(drmFD);
             }
 
-            std::ifstream instream(EDID_FILEPATH, std::ios::in | std::ios::binary);
+            std::ifstream instream(EDID_NODE, std::ios::in | std::ios::binary);
             _edid = std::vector<uint8_t>((std::istreambuf_iterator<char>(instream)),
                 std::istreambuf_iterator<char>());
         }
@@ -457,8 +463,19 @@ namespace Plugin {
             std::string hdrStr = getFirstLine(HDR_LEVEL_NODE);
             if (hdrStr == "SDR") {
                 _hdrType = Exchange::IHDRProperties::HDRType::HDR_OFF;
+            } else if (hdrStr == "HDR10-GAMMA_ST2084") {
+                _hdrType = Exchange::IHDRProperties::HDRType::HDR_10;
+            } else if (hdrStr == "HDR10-GAMMA_HLG") {
+                _hdrType = Exchange::IHDRProperties::HDRType::HDR_HLG;
+            } else if (hdrStr == "HDR10Plus-VSIF") {
+                _hdrType = Exchange::IHDRProperties::HDRType::HDR_10PLUS;
+            } else if (hdrStr == "DolbyVision-Std" || hdrStr == "DolbyVision-Lowlatency") {
+                _hdrType = Exchange::IHDRProperties::HDRType::HDR_DOLBYVISION;
+            } else if (hdrStr == "HDR10-others") {
+                TRACE(Trace::Warning, (_T("Received unknown HDR10 value. Falling back to HDR10.")));
+                _hdrType = Exchange::IHDRProperties::HDRType::HDR_10;
             } else {
-                TRACE(Trace::Error, (_T("HDR value not being handled %s"), hdrStr.c_str()));
+                TRACE(Trace::Error, (_T("Received unknown HDR value %s. Falling back to SDR."), hdrStr.c_str()));
             }
         }
 
@@ -474,6 +491,8 @@ namespace Plugin {
             if (statusFile.is_open()) {
                 getline(statusFile, line);
                 statusFile.close();
+            } else {
+                TRACE(Trace::Error, (_T("Could not open file: %s"), filepath.c_str()));
             }
             return line;
         }
