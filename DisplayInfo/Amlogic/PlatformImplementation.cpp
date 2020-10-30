@@ -31,17 +31,19 @@ namespace WPEFramework {
 namespace Plugin {
 
     namespace {
-        // The following are structures copied from udev in order to properly parse messages coming in through
-        // the socket connection(ConnectionObserver class).
-        // Found @ https://github.com/systemd/systemd/blob/master/src/libsystemd/sd-device/device-monitor.c#L50
+        /** 
+         * The following are structures copied from udev in order to properly parse messages coming in through
+         * the socket connection(ConnectionObserver class).
+         * Found @ https://github.com/systemd/systemd/blob/master/src/libsystemd/sd-device/device-monitor.c#L50
+         */
 #define UDEV_MONITOR_MAGIC 0xfeedcafe
         struct udev_monitor_netlink_header {
             /* "libudev" prefix to distinguish libudev and kernel messages */
             char prefix[8];
             /*
-         * magic to protect against daemon <-> library message format mismatch
-         * used in the kernel from socket filter rules; needs to be stored in network order
-         */
+            * magic to protect against daemon <-> library message format mismatch
+            * used in the kernel from socket filter rules; needs to be stored in network order
+            */
             unsigned int magic;
             /* total length of header structure known to the sender */
             unsigned int header_size;
@@ -49,9 +51,9 @@ namespace Plugin {
             unsigned int properties_off;
             unsigned int properties_len;
             /*
-         * hashes of primary device properties strings, to let libudev subscribers
-         * use in-kernel socket filters; values need to be stored in network order
-         */
+            * hashes of primary device properties strings, to let libudev subscribers
+            * use in-kernel socket filters; values need to be stored in network order
+            */
             unsigned int filter_subsystem_hash;
             unsigned int filter_devtype_hash;
             unsigned int filter_tag_bloom_hi;
@@ -110,10 +112,12 @@ namespace Plugin {
 
                 udev_monitor_netlink_header* header = reinterpret_cast<udev_monitor_netlink_header*>(dataFrame);
 
-                // TODO: These tags signify some filter, for now just filter out the
-                // message that has this value as 0. Investigate further within udev,
-                // what do these filters mean and how to use them in order to
-                // get only a single message per hotplug.
+                /**
+                 * TODO: These tags signify some filter, for now just filter out the
+                 * message that has this value as 0. Investigate further within udev,
+                 * what do these filters mean and how to use them in order to
+                 * get only a single message per hotplug.
+                 */
                 if (header->filter_tag_bloom_hi != 0 && header->filter_tag_bloom_lo != 0) {
 
                     int data_index = header->properties_off / sizeof(uint8_t);
@@ -206,7 +210,7 @@ namespace Plugin {
         uint32_t Register(INotification* notification) override
         {
             _observersLock.Lock();
-            
+
             auto index = std::find(_observers.begin(), _observers.end(), notification);
             ASSERT(index == _observers.end());
 
