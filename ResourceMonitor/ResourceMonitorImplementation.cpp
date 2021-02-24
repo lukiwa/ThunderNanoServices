@@ -6,6 +6,7 @@
 #include <interfaces/IResourceMonitor.h>
 #include <numeric>
 #include <sstream>
+#include <unistd.h>
 #include <vector>
 
 namespace WPEFramework {
@@ -81,7 +82,7 @@ namespace Plugin {
                 , Path("/tmp/resource.csv")
                 , Seperator(";")
                 , Interval(5)
-                , FilterName("WPE")
+                , FilterName("WPEFramework") ////FIXME
             {
                 Add(_T("csv_filepath"), &Path);
                 Add(_T("csv_sep"), &Seperator);
@@ -132,14 +133,15 @@ namespace Plugin {
 
         public:
             explicit StatCollecter(const Config& config)
-                : _logfile(config.Path.Value(), config.Seperator.Value())
-                , _interval(5)
+                : _userCpuTime(0)
+                , _systemCpuTime(0)
+                , _logfile(config.Path.Value(), config.Seperator.Value())
+                , _interval(config.Interval.Value())
+                , _filterName(config.FilterName.Value())
                 , _worker(Core::ProxyType<Worker>::Create(this))
-            {
-                _logfile.Append("Time[s]", "Name", "USS[KiB]", "PSS[KiB]", "RSS[KiB]", "VSS[KiB]");
 
-                _interval = config.Interval.Value();
-                _filterName = config.FilterName.Value();
+            {
+                _logfile.Append("Time[s]", "Name", "USS[KiB]", "PSS[KiB]", "RSS[KiB]", "VSS[KiB]", "UserCPU[%]", "SystemCPU[%]");
 
                 Core::IWorkerPool::Instance().Schedule(Core::Time::Now(), Core::ProxyType<Core::IDispatch>(_worker));
             }
@@ -150,6 +152,62 @@ namespace Plugin {
             }
 
         private:
+            void GetTotalTime(Core::process_t pid)
+            {
+                std::ifstream stat("/proc/stat");
+                if (!stat.is_open()) {
+                    TRACE(Trace::Error, (_T("Could not open /proc/stat.")));
+
+                    return;
+                }
+                std::string line;
+                std::istringstream iss;
+
+                std::getline(stat, line);
+                iss.str(line);
+
+                std::string dummy;
+                uint64_t user = 0, nice = 0, system = 0, idle = 0;
+
+                iss >> dummy >> user >> nice >> system >> idle;
+                _processTimeInfo[pid].totalTime = user + nice + system + idle;
+            }
+
+            void GetProcessTimes(Core::process_t pid)
+            {
+                std::ostringstream pathToSmaps;
+                pathToSmaps << "/proc/" << pid << "/stat";
+
+                std::ifstream stat(pathToSmaps.str());
+                if (!stat.is_open()) {
+                    TRACE(Trace::Error, (_T("Could not open %s"), pathToSmaps.str()));
+                    return;
+                }
+
+                std::string uTimeString, sTimeString;
+
+                //ignoring 13 words spearated by space
+                for (uint32_t i = 0; i < 13; ++i) {
+                    stat.ignore(std::numeric_limits<std::streamsize>::max(), ' ');
+                }
+
+                stat >> _processTimeInfo[pid].uTime >> _processTimeInfo[pid].sTime;
+            }
+
+            void CalculateCpuUsage(Core::process_t pid)
+            {
+                GetTotalTime(pid);
+                GetProcessTimes(pid);
+
+                _userCpuTime = 100.0 * (_processTimeInfo[pid].uTime - _processTimeInfo[pid].prevUTime) / (_processTimeInfo[pid].totalTime - _processTimeInfo[pid].prevTotalTime);
+
+                _systemCpuTime = 100.0 * (_processTimeInfo[pid].sTime - _processTimeInfo[pid].prevSTime) / (_processTimeInfo[pid].totalTime - _processTimeInfo[pid].prevTotalTime);
+
+                _processTimeInfo[pid].prevTotalTime = _processTimeInfo[pid].totalTime;
+                _processTimeInfo[pid].prevSTime = _processTimeInfo[pid].sTime;
+                _processTimeInfo[pid].prevUTime = _processTimeInfo[pid].uTime;
+            }
+
             void Dispatch()
             {
 
@@ -157,6 +215,7 @@ namespace Plugin {
                 Core::ProcessInfo::FindByName(_filterName, false, processes);
 
                 for (const Core::ProcessInfo& process : processes) {
+                    CalculateCpuUsage(process.Id());
                     LogProcess(process);
                 }
             }
@@ -167,18 +226,38 @@ namespace Plugin {
                 string name = process.Name() + " (" + std::to_string(process.Id()) + ")";
                 process.MemoryStats();
 
-                _logfile.Append(timestamp, name, process.USS(), process.PSS(), process.RSS(), process.VSS());
+                _logfile.Append(timestamp, name, process.USS(), process.PSS(), process.RSS(), process.VSS(), _userCpuTime, _systemCpuTime);
                 _logfile.Store();
             }
 
         private:
-            CSVFile _logfile;
+            struct Time {
+                Time()
+                    : totalTime(0)
+                    , sTime(0)
+                    , uTime(0)
+                    , prevTotalTime(0)
+                    , prevUTime(0)
+                    , prevSTime(0)
+                {
+                }
+                uint64_t totalTime;
+                uint64_t sTime;
+                uint64_t uTime;
+                uint64_t prevTotalTime;
+                uint64_t prevUTime;
+                uint64_t prevSTime;
+            };
 
-            std::vector<string> _processNames;
-            Core::CriticalSection _guard;
+            uint64_t _userCpuTime;
+            uint64_t _systemCpuTime;
+            std::map<Core::process_t, Time> _processTimeInfo;
+
+            CSVFile _logfile;
             uint32_t _interval;
             string _filterName;
 
+            Core::CriticalSection _guard;
             Core::ProxyType<Worker> _worker;
         };
 
